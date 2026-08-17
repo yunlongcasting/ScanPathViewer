@@ -13,7 +13,7 @@ Supported inputs / 支持格式:
 
 License: MIT
 """
-import os, re, sys, json, argparse, locale, traceback
+import os, re, sys, json, math, argparse, locale, traceback
 from collections import defaultdict
 
 from PyQt5.QtWidgets import (
@@ -71,6 +71,7 @@ STRINGS = {
     'save_title':   ('保存截图', 'Save snapshot'),
     'saved':        ('已保存: {0}', 'Saved: {0}'),
     'load_layer_fail_sb': ('加载层{0}失败: {1}', 'Load layer {0} failed: {1}'),
+    'layer_snap':   ('层 {0} 不存在，已跳到最近层 {1}', 'Layer {0} missing, snapped to {1}'),
     'lang_btn':     ('EN', '中文'),
 }
 
@@ -107,21 +108,91 @@ class GCodeLayer:
 # ============================================================
 # NC Parser
 # ============================================================
-RX_CMD = re.compile(r'(G0[01])\s*(.*)', re.IGNORECASE)
+RX_CMD = re.compile(r'(?:N\d+\s*)?(G0[0-3])\s*(.*)', re.IGNORECASE)
 RX_X = re.compile(r'X([\-\d.]+)')
 RX_Y = re.compile(r'Y([\-\d.]+)')
+RX_I = re.compile(r'I([\-\d.]+)')
+RX_J = re.compile(r'J([\-\d.]+)')
+RX_R = re.compile(r'R([\-\d.]+)')
+
+
+def _arc_segments(x0, y0, x1, y1, i, j, cw, n_seg=48):
+    """Discretize G02/G03 (I/J center form) into line segments.
+    Center = (x0+i, y0+j); cw=True → G02 clockwise."""
+    cx, cy = x0 + i, y0 + j
+    r = math.hypot(i, j)
+    if r < 1e-12:
+        return []
+    a0 = math.atan2(y0 - cy, x0 - cx)
+    a1 = math.atan2(y1 - cy, x1 - cx)
+    if cw:
+        sweep = a0 - a1
+        while sweep < 0: sweep += 2 * math.pi
+    else:
+        sweep = a1 - a0
+        while sweep < 0: sweep += 2 * math.pi
+    if sweep < 1e-9:
+        sweep = 2 * math.pi      # full circle
+    n = max(2, int(math.ceil(sweep / (2 * math.pi) * n_seg)))
+    pts = []
+    for k in range(n + 1):
+        t = a0 + (-sweep if cw else sweep) * k / n
+        pts.append((cx + r * math.cos(t), cy + r * math.sin(t)))
+    return [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]) for k in range(n)]
+
+
+def _arc_segments_r(x0, y0, x1, y1, r, cw, n_seg=48):
+    """Discretize G02/G03 (R form) into line segments."""
+    dx, dy = x1 - x0, y1 - y0
+    d = math.hypot(dx, dy)
+    if d < 1e-12:
+        return []
+    if abs(r) < d / 2:
+        r = math.copysign(d / 2, r)   # clamp impossible radius
+    h = math.sqrt(max(r * r - (d / 2) ** 2, 0.0))
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    s = 1.0 if r >= 0 else -1.0       # sign of R selects side of chord
+    ox, oy = -dy / d, dx / d          # unit normal to chord
+    cx, cy = mx + s * h * ox, my + s * h * oy
+    return _arc_segments(x0, y0, x1, y1, cx - x0, cy - y0, cw, n_seg)
+
 
 def parse_nc(filepath):
     g00, g01 = [], []
     lx = ly = None
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            line = line.strip()
+            line = line.split(';', 1)[0].strip()   # strip trailing comments
             if not line: continue
             m = RX_CMD.match(line)
             if not m: continue
             cmd = m.group(1).upper()
             rest = m.group(2)
+            if cmd in ('G02', 'G03'):
+                xm = RX_X.search(rest)
+                ym = RX_Y.search(rest)
+                if not xm or not ym or lx is None or ly is None: continue
+                try:
+                    x, y = float(xm.group(1)), float(ym.group(1))
+                except ValueError: continue
+                im, jm = RX_I.search(rest), RX_J.search(rest)
+                if im and jm:
+                    try:
+                        g01.extend(_arc_segments(lx, ly, x, y,
+                                                 float(im.group(1)), float(jm.group(1)),
+                                                 cmd == 'G02'))
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                else:
+                    rm = RX_R.search(rest)
+                    if rm:
+                        try:
+                            g01.extend(_arc_segments_r(lx, ly, x, y,
+                                                       float(rm.group(1)), cmd == 'G02'))
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                lx, ly = x, y
+                continue
             xm = RX_X.search(rest)
             ym = RX_Y.search(rest)
             if not xm or not ym: continue
@@ -192,6 +263,8 @@ def build_index(path):
                     'num': e['num'],
                     'path': os.path.normpath(os.path.join(base, e['file'])),
                 }
+            if not entries:
+                return None, TR.tr('no_data')
             b = idx.get('bounds')
             bounds = (b['minX'], b['minY'], b['maxX'], b['maxY']) if b else None
             return LayerIndex('merged', entries, bounds), "merged — " + TR.tr('layers').format(len(entries))
@@ -343,6 +416,8 @@ class Viewer(QMainWindow):
         self._pan_xlim = self._pan_ylim = None
         self._measuring = False
         self._meas_pts = []
+        self._accum_bounds = None
+        self._user_view = False
 
         self._init_ui()
         self._apply_lang()
@@ -456,6 +531,9 @@ class Viewer(QMainWindow):
             self._idx = None
             self._lnums = [0]; self._pos = 0
             self._bounds = None
+            self._accum_bounds = None
+            self._user_view = False
+            self._accumulate_bounds(ly)
             self.spin.setEnabled(False)
             self.btn_prev.setEnabled(False); self.btn_next.setEnabled(False)
             self.lbl_info.setText(os.path.basename(path))
@@ -481,6 +559,11 @@ class Viewer(QMainWindow):
         self._lnums = idx.lnums()
         self._pos = 0
         self._bounds = idx.bounds
+        self._accum_bounds = None
+        self._user_view = False
+        if not self._lnums:
+            QMessageBox.warning(self, TR.tr('no_data'), TR.tr('no_data'))
+            return
 
         self.spin.setEnabled(True)
         self.spin.blockSignals(True)
@@ -497,6 +580,7 @@ class Viewer(QMainWindow):
             if ly is None:
                 raise RuntimeError(f"load_layer({ln0}) returned None")
             self._cache[ln0] = ly
+            self._accumulate_bounds(ly)
         except Exception as e:
             QMessageBox.critical(self, TR.tr('load_fail'), TR.tr('read_layer_fail').format(ln0) + str(e))
             return
@@ -514,7 +598,24 @@ class Viewer(QMainWindow):
             self._preloader.start()
 
     def _on_preloaded(self, ln, ly):
-        if ly: self._cache[ln] = ly
+        if ly:
+            self._cache[ln] = ly
+            self._accumulate_bounds(ly)
+
+    def _accumulate_bounds(self, ly):
+        """Accumulate min/max XY across loaded layers (for Fit without merged bounds)."""
+        b = self._accum_bounds
+        for segs in (ly.g00, ly.g01):
+            for x1, y1, x2, y2 in segs:
+                for x, y in ((x1, y1), (x2, y2)):
+                    if b is None:
+                        b = [x, y, x, y]
+                    else:
+                        if x < b[0]: b[0] = x
+                        if y < b[1]: b[1] = y
+                        if x > b[2]: b[2] = x
+                        if y > b[3]: b[3] = y
+        self._accum_bounds = b
 
     def _stop_preloader(self):
         if self._preloader and self._preloader.isRunning():
@@ -524,7 +625,14 @@ class Viewer(QMainWindow):
     def _display(self, ly):
         self._show_g01 = self.chk_g01.isChecked()
         self._show_g00 = self.chk_g00.isChecked()
+        keep = None
+        if self._user_view:
+            keep = (self.canvas.ax.get_xlim(), self.canvas.ax.get_ylim())
         self.canvas.draw_layer(ly, self._bounds, self._show_g01, self._show_g00)
+        if keep:
+            self.canvas.ax.set_xlim(keep[0])
+            self.canvas.ax.set_ylim(keep[1])
+            self.canvas.draw()
         self.lbl_info.setText(TR.tr('cache').format(ly.c01(), ly.c00(), len(self._cache), len(self._lnums)))
         self.spin.blockSignals(True)
         self.spin.setValue(ly.n)
@@ -548,7 +656,16 @@ class Viewer(QMainWindow):
             except Exception as e:
                 self.sbar.showMessage(TR.tr('load_layer_fail_sb').format(ln, e))
 
-    def _on_spin(self, v): self._goto(v)
+    def _on_spin(self, v):
+        if v in self._lnums:
+            self._goto(v)
+        else:
+            closest = min(self._lnums, key=lambda x: abs(x - v))
+            self.sbar.showMessage(TR.tr('layer_snap').format(v, closest))
+            self.spin.blockSignals(True)
+            self.spin.setValue(closest)
+            self.spin.blockSignals(False)
+            self._goto(closest)
     def _prev(self):
         if self._pos > 0: self._pos -= 1; self._goto(self._lnums[self._pos])
     def _next(self):
@@ -568,13 +685,21 @@ class Viewer(QMainWindow):
 
     # ---- Zoom & Pan ----
     def _fit(self):
-        if self._bounds:
-            self.canvas.ax.set_xlim(self._bounds[0]-2, self._bounds[2]+2)
-            self.canvas.ax.set_ylim(self._bounds[1]-2, self._bounds[3]+2)
-            self.canvas.ax.set_aspect('equal'); self.canvas.draw()
+        ax = self.canvas.ax
+        self._user_view = False
+        b = self._bounds or self._accum_bounds
+        if b:
+            ax.set_xlim(b[0] - 2, b[2] + 2)
+            ax.set_ylim(b[1] - 2, b[3] + 2)
+        else:
+            ax.relim()
+            ax.autoscale()
+        ax.set_aspect('equal')
+        self.canvas.draw()
 
     def _on_scroll(self, e):
         if e.xdata is None: return
+        self._user_view = True
         ax = self.canvas.ax; f = 0.7 if e.button == 'up' else 1/0.7
         xl, xr = ax.get_xlim(); yb, yt = ax.get_ylim()
         ax.set_xlim(e.xdata - (e.xdata-xl)*f, e.xdata + (xr-e.xdata)*f)
@@ -584,6 +709,7 @@ class Viewer(QMainWindow):
     def _on_click(self, e):
         if e.inaxes != self.canvas.ax: return
         if e.button == 2:
+            self._user_view = True
             self._pan_start = (e.xdata, e.ydata)
             self._pan_xlim = self.canvas.ax.get_xlim()
             self._pan_ylim = self.canvas.ax.get_ylim()
