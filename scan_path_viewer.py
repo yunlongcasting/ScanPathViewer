@@ -108,7 +108,7 @@ class GCodeLayer:
 # ============================================================
 # NC Parser
 # ============================================================
-RX_CMD = re.compile(r'(?:N\d+\s*)?(G0[0-3])\s*(.*)', re.IGNORECASE)
+RX_CMD = re.compile(r'(?:N\d+\s*)?(G0?[0-3])(?!\d)\s*(.*)', re.IGNORECASE)
 RX_X = re.compile(r'X([\-\d.]+)')
 RX_Y = re.compile(r'Y([\-\d.]+)')
 RX_I = re.compile(r'I([\-\d.]+)')
@@ -151,7 +151,7 @@ def _arc_segments_r(x0, y0, x1, y1, r, cw, n_seg=48):
         r = math.copysign(d / 2, r)   # clamp impossible radius
     h = math.sqrt(max(r * r - (d / 2) ** 2, 0.0))
     mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-    s = 1.0 if r >= 0 else -1.0       # sign of R selects side of chord
+    s = (-1.0 if cw else 1.0) * (1.0 if r >= 0 else -1.0)   # R sign picks side; flip for G02 (cw) per CNC convention
     ox, oy = -dy / d, dx / d          # unit normal to chord
     cx, cy = mx + s * h * ox, my + s * h * oy
     return _arc_segments(x0, y0, x1, y1, cx - x0, cy - y0, cw, n_seg)
@@ -166,7 +166,7 @@ def parse_nc(filepath):
             if not line: continue
             m = RX_CMD.match(line)
             if not m: continue
-            cmd = m.group(1).upper()
+            cmd = 'G0' + m.group(1).upper()[-1]   # normalize G1/G2/G3 -> G01/G02/G03
             rest = m.group(2)
             if cmd in ('G02', 'G03'):
                 xm = RX_X.search(rest)
